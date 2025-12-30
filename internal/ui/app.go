@@ -1,7 +1,10 @@
 package ui
 
 import (
+	"context"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -9,16 +12,29 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/levineuwirth/gophermark/internal/audit"
+	"github.com/levineuwirth/gophermark/internal/db"
+	"github.com/levineuwirth/gophermark/internal/dedup"
 	"github.com/levineuwirth/gophermark/internal/export"
 	"github.com/levineuwirth/gophermark/internal/models"
 	"github.com/levineuwirth/gophermark/internal/staging"
 )
+
+var debugLog *log.Logger
+
+func init() {
+	f, err := os.OpenFile("/tmp/gophermark-debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		debugLog = log.New(f, "", log.Ltime|log.Lmicroseconds|log.Lshortfile)
+	}
+}
 
 type Pane int
 
 const (
 	TreePane Pane = iota
 	ListPane
+	InspectorPane
 )
 
 type EditMode int
@@ -31,6 +47,8 @@ const (
 	AddURL
 	SearchMode
 	ExportMode
+	AuditMode
+	DedupMode
 )
 
 type Model struct {
@@ -63,6 +81,17 @@ type Model struct {
 	dbPath            string
 	stagingDB         *staging.StagingDB
 	hasPendingChanges bool
+
+	showInspector    bool
+	auditResults     map[int64]string
+	auditInProgress  bool
+	auditTotal       int
+	auditCompleted   int
+	dedupGroups      []string
+	dedupSelected    int
+	dedupScanning    bool
+	scanSpinner      int
+	viewCount        int
 }
 
 func NewModel(root *models.Bookmark, folders []*models.Bookmark, dbPath string) *Model {
@@ -114,8 +143,27 @@ func NewModel(root *models.Bookmark, folders []*models.Bookmark, dbPath string) 
 		urlInput:          urlInput,
 		searchInput:       searchInput,
 		editMode:          EditNone,
+		auditResults:      make(map[int64]string),
+		showInspector:     false,
 	}
 }
+
+type auditProgressMsg struct {
+	total     int
+	completed int
+	result    audit.LinkResult
+}
+
+type auditCompleteMsg struct{}
+
+type dedupResultMsg struct {
+	groups []dedup.DuplicateGroup
+	err    error
+}
+
+type dedupTickMsg struct{}
+
+type auditTickMsg struct{}
 
 func (m *Model) Init() tea.Cmd {
 	return nil
@@ -232,7 +280,114 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.editMode == AuditMode {
+		if _, ok := msg.(tea.KeyMsg); ok {
+			if !m.auditInProgress {
+				m.editMode = EditNone
+				m.statusMessage = ""
+				return m, nil
+			}
+		}
+	}
+
+	if m.editMode == DedupMode {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			if m.dedupScanning {
+				return m, nil
+			}
+
+			switch keyMsg.String() {
+			case "j", "down":
+				if len(m.dedupGroups) > 0 && m.dedupSelected < len(m.dedupGroups)-1 {
+					m.dedupSelected++
+				}
+				return m, nil
+			case "k", "up":
+				if len(m.dedupGroups) > 0 && m.dedupSelected > 0 {
+					m.dedupSelected--
+				}
+				return m, nil
+			default:
+				m.editMode = EditNone
+				m.statusMessage = ""
+				return m, nil
+			}
+		}
+	}
+
 	switch msg := msg.(type) {
+	case auditProgressMsg:
+		m.auditTotal = msg.total
+		m.auditCompleted = msg.completed
+		if msg.result.Status == audit.StatusDead || msg.result.Status == audit.StatusTimeout {
+			m.auditResults[msg.result.Bookmark.ID] = "DEAD"
+		} else {
+			m.auditResults[msg.result.Bookmark.ID] = "OK"
+		}
+		return m, nil
+
+	case auditTickMsg:
+		if m.auditInProgress {
+			m.scanSpinner = (m.scanSpinner + 1) % 4
+			return m, m.tickAudit()
+		}
+		return m, nil
+
+	case auditCompleteMsg:
+		m.auditInProgress = false
+		deadCount := 0
+		for _, status := range m.auditResults {
+			if status == "DEAD" {
+				deadCount++
+			}
+		}
+		m.statusMessage = fmt.Sprintf("✓ Audit complete: %d dead links found", deadCount)
+		return m, nil
+
+	case dedupTickMsg:
+		if debugLog != nil {
+			debugLog.Printf("Update: received dedupTickMsg, scanning=%v", m.dedupScanning)
+		}
+		if m.dedupScanning {
+			m.scanSpinner = (m.scanSpinner + 1) % 4
+			return m, m.tickDedup()
+		}
+		return m, nil
+
+	case dedupResultMsg:
+		if debugLog != nil {
+			debugLog.Printf("Update: received dedupResultMsg with %d groups, err=%v", len(msg.groups), msg.err)
+		}
+		m.dedupScanning = false
+		if msg.err != nil {
+			m.statusMessage = "❌ Dedup failed: " + msg.err.Error()
+			m.editMode = EditNone
+			if debugLog != nil {
+				debugLog.Println("Update: dedupResultMsg handling complete (error case)")
+			}
+			return m, nil
+		}
+
+		if debugLog != nil {
+			debugLog.Println("Update: building group summaries")
+		}
+		var groupSummaries []string
+		for _, group := range msg.groups {
+			groupSummaries = append(groupSummaries, fmt.Sprintf("%s (%d duplicates)", group.URL, len(group.Bookmarks)))
+		}
+		m.dedupGroups = groupSummaries
+		m.dedupSelected = 0
+
+		if len(msg.groups) == 0 {
+			m.statusMessage = "✓ No duplicates found"
+		} else {
+			m.statusMessage = fmt.Sprintf("Found %d duplicate groups", len(msg.groups))
+		}
+		if debugLog != nil {
+			debugLog.Println("Update: dedupResultMsg handling complete (success case)")
+		}
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -307,6 +462,25 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.enterExportMode()
 			return m, nil
 
+		case "i":
+			m.toggleInspector()
+			return m, nil
+
+		case "a":
+			if m.editMode == EditNone {
+				return m, m.startAudit()
+			}
+			return m, nil
+
+		case "D":
+			if m.editMode == EditNone {
+				if debugLog != nil {
+					debugLog.Println("User pressed D key - starting dedup")
+				}
+				return m, m.startDedup()
+			}
+			return m, nil
+
 		case "ctrl+s":
 			if m.hasPendingChanges {
 				return m.commitChanges(), nil
@@ -319,6 +493,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) View() string {
+	m.viewCount++
+	if m.viewCount%10 == 0 && debugLog != nil {
+		debugLog.Printf("View: called %d times, dedupScanning=%v, editMode=%d", m.viewCount, m.dedupScanning, m.editMode)
+	}
+
 	if !m.ready {
 		return "Loading..."
 	}
@@ -327,7 +506,12 @@ func (m *Model) View() string {
 		return fmt.Sprintf("Error: %v\n", m.err)
 	}
 
-	paneWidth := m.width/2 - 4
+	numPanes := 2
+	if m.showInspector {
+		numPanes = 3
+	}
+
+	paneWidth := (m.width / numPanes) - 4
 	paneHeight := m.height - 8
 
 	treeContent := m.renderTree(paneHeight)
@@ -342,16 +526,26 @@ func (m *Model) View() string {
 		listPane = m.stylePane(ListPane, listContent, paneWidth, paneHeight)
 	}
 
-	mainView := lipgloss.JoinHorizontal(lipgloss.Top, treePane, listPane)
+	var mainView string
+	if m.showInspector {
+		inspectorContent := m.renderInspector(paneHeight)
+		inspectorPane := m.stylePane(InspectorPane, inspectorContent, paneWidth, paneHeight)
+		mainView = lipgloss.JoinHorizontal(lipgloss.Top, treePane, listPane, inspectorPane)
+	} else {
+		mainView = lipgloss.JoinHorizontal(lipgloss.Top, treePane, listPane)
+	}
 
 	title := titleStyle.Render("GopherMark - Firefox/LibreWolf Bookmark Manager")
 
-	help := "j/k: navigate | Space: expand/collapse | Tab: switch | /: search | n: new | e: edit | m: mark | x: export | "
+	help := "j/k: nav | Space: toggle | Tab: switch | /: search | n: new | e: edit | m: mark | x: export | i: inspector | a: audit | D: dedup | "
 	if len(m.selectedBookmarks) > 0 {
 		help += fmt.Sprintf("d: delete (%d) | ", len(m.selectedBookmarks))
 	}
 	if m.hasPendingChanges {
 		help += "Ctrl+S: commit | "
+	}
+	if m.auditInProgress {
+		help += fmt.Sprintf("Audit: %d/%d | ", m.auditCompleted, m.auditTotal)
 	}
 	help += "q: quit"
 
@@ -374,6 +568,74 @@ func (m *Model) View() string {
 
 func (m *Model) renderEditForm(maxHeight int) string {
 	var lines []string
+
+	if m.editMode == AuditMode {
+		lines = append(lines, folderStyle.Render("🔍 Link Audit"))
+		lines = append(lines, "")
+		if m.auditInProgress {
+			spinnerFrames := []string{"⠋", "⠙", "⠹", "⠸"}
+			spinner := spinnerFrames[m.scanSpinner]
+			progress := fmt.Sprintf("%s Progress: %d/%d", spinner, m.auditCompleted, m.auditTotal)
+			lines = append(lines, normalItemStyle.Render(progress))
+			lines = append(lines, "")
+			lines = append(lines, dimStyle.Render("Checking links for broken URLs..."))
+		} else {
+			lines = append(lines, dimStyle.Render("Audit complete"))
+			lines = append(lines, "")
+			lines = append(lines, dimStyle.Render("Press any key to close"))
+		}
+		return strings.Join(lines, "\n")
+	}
+
+	if m.editMode == DedupMode {
+		lines = append(lines, folderStyle.Render("🔗 Duplicate Detection"))
+		lines = append(lines, "")
+
+		if m.dedupScanning {
+			spinnerFrames := []string{"⠋", "⠙", "⠹", "⠸"}
+			spinner := spinnerFrames[m.scanSpinner]
+			lines = append(lines, dimStyle.Render(spinner+" Scanning database for duplicates..."))
+			lines = append(lines, "")
+			lines = append(lines, dimStyle.Render("This may take a moment for large databases."))
+		} else if len(m.dedupGroups) == 0 {
+			lines = append(lines, dimStyle.Render("No duplicates found"))
+			lines = append(lines, "")
+			lines = append(lines, dimStyle.Render("Press any key to close"))
+		} else {
+			lines = append(lines, normalItemStyle.Render(fmt.Sprintf("Found %d duplicate groups:", len(m.dedupGroups))))
+			lines = append(lines, "")
+
+			start := 0
+			end := len(m.dedupGroups)
+			if end > maxHeight-6 {
+				if m.dedupSelected > maxHeight/2 {
+					start = m.dedupSelected - maxHeight/2
+				}
+				end = start + maxHeight - 6
+				if end > len(m.dedupGroups) {
+					end = len(m.dedupGroups)
+					start = end - (maxHeight - 6)
+					if start < 0 {
+						start = 0
+					}
+				}
+			}
+
+			for i := start; i < end; i++ {
+				prefix := "  "
+				style := normalItemStyle
+				if i == m.dedupSelected {
+					prefix = "❯ "
+					style = selectedItemStyle
+				}
+				lines = append(lines, style.Render(prefix+m.dedupGroups[i]))
+			}
+			lines = append(lines, "")
+			lines = append(lines, dimStyle.Render("j/k: navigate | any other key: close"))
+		}
+
+		return strings.Join(lines, "\n")
+	}
 
 	if m.editMode == ExportMode {
 		lines = append(lines, folderStyle.Render("📤 Export Bookmarks"))
@@ -939,6 +1201,180 @@ func (m *Model) exportHTML() {
 	}
 
 	m.editMode = EditNone
+}
+
+func (m *Model) renderInspector(maxHeight int) string {
+	var lines []string
+	lines = append(lines, folderStyle.Render("🔬 Inspector"))
+	lines = append(lines, "")
+
+	if m.activePane != ListPane || len(m.bookmarks) == 0 || m.listCursor >= len(m.bookmarks) {
+		lines = append(lines, dimStyle.Render("(no bookmark selected)"))
+		return strings.Join(lines, "\n")
+	}
+
+	bookmark := m.bookmarks[m.listCursor]
+
+	lines = append(lines, normalItemStyle.Render("Title:"))
+	title := bookmark.Title
+	if len(title) > 30 {
+		title = title[:27] + "..."
+	}
+	lines = append(lines, dimStyle.Render("  "+title))
+	lines = append(lines, "")
+
+	lines = append(lines, normalItemStyle.Render("URL:"))
+	url := bookmark.URL
+	if len(url) > 30 {
+		url = url[:27] + "..."
+	}
+	lines = append(lines, dimStyle.Render("  "+url))
+	lines = append(lines, "")
+
+	lines = append(lines, normalItemStyle.Render("GUID:"))
+	lines = append(lines, dimStyle.Render("  "+bookmark.GUID))
+	lines = append(lines, "")
+
+	lines = append(lines, normalItemStyle.Render("ID:"))
+	lines = append(lines, dimStyle.Render(fmt.Sprintf("  %d", bookmark.ID)))
+	lines = append(lines, "")
+
+	lines = append(lines, normalItemStyle.Render("Added:"))
+	lines = append(lines, dimStyle.Render("  "+bookmark.DateAdded.Format("2006-01-02 15:04")))
+	lines = append(lines, "")
+
+	lines = append(lines, normalItemStyle.Render("Modified:"))
+	lines = append(lines, dimStyle.Render("  "+bookmark.LastModified.Format("2006-01-02 15:04")))
+	lines = append(lines, "")
+
+	lines = append(lines, normalItemStyle.Render("Visits:"))
+	lines = append(lines, dimStyle.Render(fmt.Sprintf("  %d", bookmark.VisitCount)))
+	lines = append(lines, "")
+
+	if status, ok := m.auditResults[bookmark.ID]; ok {
+		lines = append(lines, normalItemStyle.Render("Link Status:"))
+		statusStyle := dimStyle
+		if status == "DEAD" {
+			statusStyle = lipgloss.NewStyle().Foreground(accentColor)
+		}
+		lines = append(lines, statusStyle.Render("  "+status))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func (m *Model) toggleInspector() {
+	m.showInspector = !m.showInspector
+	if m.showInspector {
+		m.statusMessage = "Inspector panel shown"
+	} else {
+		m.statusMessage = "Inspector panel hidden"
+	}
+}
+
+func (m *Model) startAudit() tea.Cmd {
+	m.editMode = AuditMode
+	m.auditInProgress = true
+	m.auditResults = make(map[int64]string)
+	m.auditTotal = 0
+	m.auditCompleted = 0
+	m.scanSpinner = 0
+	m.statusMessage = "Starting link audit..."
+
+	return tea.Batch(
+		m.runAudit(),
+		m.tickAudit(),
+	)
+}
+
+func (m *Model) tickAudit() tea.Cmd {
+	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
+		return auditTickMsg{}
+	})
+}
+
+func (m *Model) runAudit() tea.Cmd {
+	return func() tea.Msg {
+		auditor := audit.NewAuditor(10)
+		ctx := context.Background()
+		resultChan := auditor.AuditAll(ctx, m.root)
+
+		for range resultChan {
+		}
+
+		return auditCompleteMsg{}
+	}
+}
+
+func (m *Model) startDedup() tea.Cmd {
+	if debugLog != nil {
+		debugLog.Println("startDedup: entering function")
+	}
+	m.editMode = DedupMode
+	m.dedupScanning = true
+	m.dedupGroups = nil
+	m.scanSpinner = 0
+	m.statusMessage = "Scanning for duplicates..."
+
+	if debugLog != nil {
+		debugLog.Println("startDedup: calling tea.Batch with runDedup and tickDedup")
+	}
+	return tea.Batch(
+		m.runDedup(),
+		m.tickDedup(),
+	)
+}
+
+func (m *Model) runDedup() tea.Cmd {
+	dbPath := m.dbPath
+	if debugLog != nil {
+		debugLog.Println("runDedup: creating command function")
+	}
+	return func() tea.Msg {
+		if debugLog != nil {
+			debugLog.Println("runDedup: command function executing")
+		}
+		if debugLog != nil {
+			debugLog.Printf("runDedup: opening database at %s", dbPath)
+		}
+		dbConn, err := db.OpenReadOnly(dbPath)
+		if err != nil {
+			if debugLog != nil {
+				debugLog.Printf("runDedup: database open failed: %v", err)
+			}
+			return dedupResultMsg{err: err}
+		}
+		defer dbConn.Close()
+
+		if debugLog != nil {
+			debugLog.Println("runDedup: database opened, calling FindDuplicates")
+		}
+		groups, err := dedup.FindDuplicates(dbConn.Conn())
+		if debugLog != nil {
+			debugLog.Printf("runDedup: FindDuplicates returned, groups=%d, err=%v", len(groups), err)
+		}
+		return dedupResultMsg{groups: groups, err: err}
+	}
+}
+
+func (m *Model) tickDedup() tea.Cmd {
+	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
+		return dedupTickMsg{}
+	})
+}
+
+func collectAllBookmarks(node *models.Bookmark) []*models.Bookmark {
+	var bookmarks []*models.Bookmark
+
+	if node.IsBookmark() {
+		bookmarks = append(bookmarks, node)
+	}
+
+	for _, child := range node.Children {
+		bookmarks = append(bookmarks, collectAllBookmarks(child)...)
+	}
+
+	return bookmarks
 }
 
 func getBookmarksForFolder(folder *models.Bookmark) []*models.Bookmark {

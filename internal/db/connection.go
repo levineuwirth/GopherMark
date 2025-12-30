@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -13,14 +14,16 @@ type DB struct {
 }
 
 func OpenReadOnly(dbPath string) (*DB, error) {
-	// read-only mode with nolock and immutable to bypass Firefox's exclusive lock
-	// URI format: file:path?mode=ro&nolock=1&immutable=1
-	uri := fmt.Sprintf("file:%s?mode=ro&nolock=1&immutable=1", dbPath)
+	uri := fmt.Sprintf("file:%s?mode=ro&nolock=1&immutable=1&_query_only=1&_timeout=5000", dbPath)
 
 	conn, err := sql.Open("sqlite", uri)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	conn.SetConnMaxLifetime(10 * time.Second)
 
 	if err := conn.Ping(); err != nil {
 		conn.Close()

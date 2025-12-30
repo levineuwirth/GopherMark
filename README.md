@@ -33,6 +33,11 @@ gophermark
 - `m` - Toggle selection for batch operations
 - `d` - Delete selected bookmark(s)
 
+### Advanced Features
+- `i` - Toggle inspector panel (shows bookmark metadata)
+- `a` - Audit links (check for dead/broken URLs)
+- `D` - Detect duplicate bookmarks
+
 ### Other
 - `/` - Search bookmarks (fuzzy match on title/URL)
 - `x` - Export bookmarks (j=JSON, h=HTML)
