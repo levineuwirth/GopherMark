@@ -49,6 +49,8 @@ const (
 	ExportMode
 	AuditMode
 	DedupMode
+	ScratchAdd
+	BulkMoveMode
 )
 
 type Model struct {
@@ -73,6 +75,7 @@ type Model struct {
 	titleInput    textinput.Model
 	urlInput      textinput.Model
 	searchInput   textinput.Model
+	scratchInput  textinput.Model
 	statusMessage string
 
 	searchResults []*models.Bookmark
@@ -92,6 +95,9 @@ type Model struct {
 	dedupScanning    bool
 	scanSpinner      int
 	viewCount        int
+
+	bulkMoveFolders  []*models.Bookmark
+	bulkMoveSelected int
 }
 
 func NewModel(root *models.Bookmark, folders []*models.Bookmark, dbPath string) *Model {
@@ -128,6 +134,10 @@ func NewModel(root *models.Bookmark, folders []*models.Bookmark, dbPath string) 
 	searchInput.Placeholder = "Search bookmarks..."
 	searchInput.CharLimit = 256
 
+	scratchInput := textinput.New()
+	scratchInput.Placeholder = "https://example.com"
+	scratchInput.CharLimit = 2048
+
 	return &Model{
 		root:              root,
 		treeNodes:         treeNodes,
@@ -142,6 +152,7 @@ func NewModel(root *models.Bookmark, folders []*models.Bookmark, dbPath string) 
 		titleInput:        titleInput,
 		urlInput:          urlInput,
 		searchInput:       searchInput,
+		scratchInput:      scratchInput,
 		editMode:          EditNone,
 		auditResults:      make(map[int64]string),
 		showInspector:     false,
@@ -238,6 +249,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	if m.editMode == ScratchAdd {
+		var cmd tea.Cmd
+		m.scratchInput, cmd = m.scratchInput.Update(msg)
+
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			switch keyMsg.String() {
+			case "enter":
+				return m.saveScratchBookmark(), nil
+			case "esc":
+				m.editMode = EditNone
+				m.statusMessage = ""
+				return m, nil
+			}
+		}
+		return m, cmd
+	}
+
 	if m.editMode == SearchMode {
 		var cmd tea.Cmd
 		m.searchInput, cmd = m.searchInput.Update(msg)
@@ -313,6 +341,30 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+	}
+
+	if m.editMode == BulkMoveMode {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			switch keyMsg.String() {
+			case "j", "down":
+				if len(m.bulkMoveFolders) > 0 && m.bulkMoveSelected < len(m.bulkMoveFolders)-1 {
+					m.bulkMoveSelected++
+				}
+				return m, nil
+			case "k", "up":
+				if len(m.bulkMoveFolders) > 0 && m.bulkMoveSelected > 0 {
+					m.bulkMoveSelected--
+				}
+				return m, nil
+			case "enter":
+				return m.executeBulkMove(), nil
+			case "esc":
+				m.editMode = EditNone
+				m.statusMessage = ""
+				return m, nil
+			}
+		}
+		return m, nil
 	}
 
 	switch msg := msg.(type) {
@@ -430,6 +482,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case "esc", "escape":
+			if m.currentFolder != nil && m.currentFolder.Title == "Scratch" {
+				bookmarksBar := FindBookmarksBar(m.root)
+				if bookmarksBar != nil {
+					m.currentFolder = bookmarksBar
+					m.bookmarks = getBookmarksForFolder(m.currentFolder)
+					m.listCursor = 0
+					m.statusMessage = "Navigated to Bookmarks Bar"
+
+					idx := FindNodeIndex(m.treeNodes, bookmarksBar.ID)
+					if idx >= 0 {
+						m.treeCursor = idx
+					}
+				}
+			}
+			return m, nil
+
 		case "e":
 			if m.activePane == ListPane && len(m.bookmarks) > 0 {
 				m.enterEditMode()
@@ -439,6 +508,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "n":
 			if m.activePane == ListPane && m.currentFolder != nil {
 				m.enterAddMode()
+			}
+			return m, nil
+
+		case "s":
+			if m.editMode == EditNone {
+				m.enterScratchMode()
+			}
+			return m, nil
+
+		case "S":
+			if m.editMode == EditNone {
+				m.jumpToScratch()
+			}
+			return m, nil
+
+		case "b":
+			if m.editMode == EditNone && m.currentFolder != nil && m.currentFolder.Title == "Scratch" && len(m.selectedBookmarks) > 0 {
+				m.enterBulkMoveMode()
 			}
 			return m, nil
 
@@ -537,9 +624,12 @@ func (m *Model) View() string {
 
 	title := titleStyle.Render("GopherMark - Firefox/LibreWolf Bookmark Manager")
 
-	help := "j/k: nav | Space: toggle | Tab: switch | /: search | n: new | e: edit | m: mark | x: export | i: inspector | a: audit | D: dedup | "
+	help := "j/k: nav | Space: toggle | Tab: switch | /: search | s: scratch | S: jump | n: new | e: edit | m: mark | x: export | i: inspector | a: audit | D: dedup | "
 	if len(m.selectedBookmarks) > 0 {
 		help += fmt.Sprintf("d: delete (%d) | ", len(m.selectedBookmarks))
+		if m.currentFolder != nil && m.currentFolder.Title == "Scratch" {
+			help += fmt.Sprintf("b: bulk move (%d) | ", len(m.selectedBookmarks))
+		}
 	}
 	if m.hasPendingChanges {
 		help += "Ctrl+S: commit | "
@@ -663,6 +753,63 @@ func (m *Model) renderEditForm(maxHeight int) string {
 		}
 		lines = append(lines, "")
 		lines = append(lines, dimStyle.Render("Enter/Esc: exit search"))
+
+		return strings.Join(lines, "\n")
+	}
+
+	if m.editMode == ScratchAdd {
+		lines = append(lines, folderStyle.Render("📥 Quick Add to Scratch"))
+		lines = append(lines, "")
+		lines = append(lines, dimStyle.Render("Add links to refine later"))
+		lines = append(lines, "")
+		lines = append(lines, "URL:")
+		lines = append(lines, m.scratchInput.View())
+		lines = append(lines, "")
+		lines = append(lines, dimStyle.Render("Enter: save | Esc: cancel"))
+
+		return strings.Join(lines, "\n")
+	}
+
+	if m.editMode == BulkMoveMode {
+		lines = append(lines, folderStyle.Render("📦 Bulk Move from Scratch"))
+		lines = append(lines, "")
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("Moving %d selected bookmarks", len(m.selectedBookmarks))))
+		lines = append(lines, "")
+		lines = append(lines, normalItemStyle.Render("Select destination folder:"))
+		lines = append(lines, "")
+
+		start := 0
+		end := len(m.bulkMoveFolders)
+		if end > maxHeight-8 {
+			if m.bulkMoveSelected > maxHeight/2 {
+				start = m.bulkMoveSelected - maxHeight/2
+			}
+			end = start + maxHeight - 8
+			if end > len(m.bulkMoveFolders) {
+				end = len(m.bulkMoveFolders)
+				start = end - (maxHeight - 8)
+				if start < 0 {
+					start = 0
+				}
+			}
+		}
+
+		for i := start; i < end; i++ {
+			folder := m.bulkMoveFolders[i]
+			prefix := "  "
+			style := normalItemStyle
+			if i == m.bulkMoveSelected {
+				prefix = "❯ "
+				style = selectedItemStyle
+			}
+			title := folder.Title
+			if len(title) > 35 {
+				title = title[:32] + "..."
+			}
+			lines = append(lines, style.Render(prefix+title))
+		}
+		lines = append(lines, "")
+		lines = append(lines, dimStyle.Render("j/k: navigate | Enter: move | Esc: cancel"))
 
 		return strings.Join(lines, "\n")
 	}
@@ -979,6 +1126,22 @@ func (m *Model) enterSearchMode() {
 	m.statusMessage = "Search mode: type to find bookmarks"
 }
 
+func (m *Model) enterScratchMode() {
+	if m.stagingDB == nil {
+		var err error
+		m.stagingDB, err = staging.CreateStaging(m.dbPath)
+		if err != nil {
+			m.statusMessage = "Failed to create staging database: " + err.Error()
+			return
+		}
+	}
+
+	m.scratchInput.SetValue("")
+	m.scratchInput.Focus()
+	m.editMode = ScratchAdd
+	m.statusMessage = "Quick add to Scratch folder"
+}
+
 func (m *Model) exitSearchMode() {
 	m.editMode = EditNone
 	m.searchInput.Blur()
@@ -1103,6 +1266,82 @@ func (m *Model) saveNewBookmark() *Model {
 	m.urlInput.Blur()
 
 	m.listCursor = len(m.bookmarks) - 1
+
+	return m
+}
+
+func (m *Model) saveScratchBookmark() *Model {
+	url := m.scratchInput.Value()
+
+	if url == "" {
+		m.statusMessage = "URL is required"
+		return m
+	}
+
+	scratchFolder := findFolderByTitle(m.root, "Scratch")
+	var scratchFolderID int64
+
+	if scratchFolder == nil {
+		var err error
+		scratchFolderID, err = m.stagingDB.FindOrCreateScratchFolder()
+		if err != nil {
+			m.statusMessage = "Failed to find/create Scratch folder: " + err.Error()
+			m.editMode = EditNone
+			return m
+		}
+
+		bookmarksMenu := findFolderByGUID(m.root, "menu________")
+		if bookmarksMenu != nil {
+			now := time.Now()
+			scratchFolder = &models.Bookmark{
+				ID:           scratchFolderID,
+				Type:         models.TypeFolder,
+				Parent:       bookmarksMenu.ID,
+				Position:     len(bookmarksMenu.Children),
+				Title:        "Scratch",
+				DateAdded:    now,
+				LastModified: now,
+				Children:     make([]*models.Bookmark, 0),
+			}
+			bookmarksMenu.Children = append(bookmarksMenu.Children, scratchFolder)
+			m.treeNodes = BuildFlatTree(m.root, m.expandedFolders)
+		}
+	} else {
+		scratchFolderID = scratchFolder.ID
+	}
+
+	title := url
+	if len(title) > 50 {
+		title = title[:47] + "..."
+	}
+
+	err := m.stagingDB.AddBookmark(scratchFolderID, title, url)
+	if err != nil {
+		m.statusMessage = "Failed to add to scratch: " + err.Error()
+		m.editMode = EditNone
+		return m
+	}
+
+	now := time.Now()
+	newBookmark := &models.Bookmark{
+		Type:         models.TypeBookmark,
+		Parent:       scratchFolderID,
+		Position:     len(scratchFolder.Children),
+		Title:        title,
+		URL:          url,
+		DateAdded:    now,
+		LastModified: now,
+	}
+	scratchFolder.Children = append(scratchFolder.Children, newBookmark)
+
+	if m.currentFolder == scratchFolder {
+		m.bookmarks = getBookmarksForFolder(m.currentFolder)
+	}
+
+	m.hasPendingChanges = true
+	m.editMode = EditNone
+	m.statusMessage = "✓ Added to Scratch (Ctrl+S to commit)"
+	m.scratchInput.Blur()
 
 	return m
 }
@@ -1389,4 +1628,139 @@ func getBookmarksForFolder(folder *models.Bookmark) []*models.Bookmark {
 		}
 	}
 	return bookmarks
+}
+
+func (m *Model) jumpToScratch() {
+	scratchFolder := findFolderByTitle(m.root, "Scratch")
+	if scratchFolder == nil {
+		m.statusMessage = "Scratch folder not found. Add an item with 's' to create it."
+		return
+	}
+
+	ExpandPath(m.root, scratchFolder, m.expandedFolders)
+	m.treeNodes = BuildFlatTree(m.root, m.expandedFolders)
+
+	idx := FindNodeIndex(m.treeNodes, scratchFolder.ID)
+	if idx >= 0 {
+		m.treeCursor = idx
+		m.currentFolder = scratchFolder
+		m.bookmarks = getBookmarksForFolder(m.currentFolder)
+		m.listCursor = 0
+		m.activePane = ListPane
+		m.statusMessage = "Jumped to Scratch folder"
+	}
+}
+
+func findFolderByTitle(node *models.Bookmark, title string) *models.Bookmark {
+	if node.IsFolder() && node.Title == title {
+		return node
+	}
+
+	for _, child := range node.Children {
+		if result := findFolderByTitle(child, title); result != nil {
+			return result
+		}
+	}
+
+	return nil
+}
+
+func findFolderByGUID(node *models.Bookmark, guid string) *models.Bookmark {
+	if node.IsFolder() && node.GUID == guid {
+		return node
+	}
+
+	for _, child := range node.Children {
+		if result := findFolderByGUID(child, guid); result != nil {
+			return result
+		}
+	}
+
+	return nil
+}
+
+func (m *Model) enterBulkMoveMode() {
+	var allFolders []*models.Bookmark
+	var collectFolders func(*models.Bookmark)
+	collectFolders = func(node *models.Bookmark) {
+		if node.IsFolder() && node.Title != "Scratch" {
+			allFolders = append(allFolders, node)
+		}
+		for _, child := range node.Children {
+			collectFolders(child)
+		}
+	}
+	collectFolders(m.root)
+
+	m.bulkMoveFolders = allFolders
+	m.bulkMoveSelected = 0
+	m.editMode = BulkMoveMode
+	m.statusMessage = fmt.Sprintf("Select destination for %d bookmarks", len(m.selectedBookmarks))
+}
+
+func (m *Model) executeBulkMove() *Model {
+	if m.bulkMoveSelected >= len(m.bulkMoveFolders) {
+		m.statusMessage = "No folder selected"
+		m.editMode = EditNone
+		return m
+	}
+
+	if m.stagingDB == nil {
+		var err error
+		m.stagingDB, err = staging.CreateStaging(m.dbPath)
+		if err != nil {
+			m.statusMessage = "Failed to create staging database: " + err.Error()
+			m.editMode = EditNone
+			return m
+		}
+	}
+
+	destFolder := m.bulkMoveFolders[m.bulkMoveSelected]
+	movedCount := 0
+	var moveErrors []string
+
+	for bookmarkID := range m.selectedBookmarks {
+		var bookmark *models.Bookmark
+		for _, b := range m.bookmarks {
+			if b.ID == bookmarkID {
+				bookmark = b
+				break
+			}
+		}
+
+		if bookmark == nil {
+			continue
+		}
+
+		err := m.stagingDB.MoveBookmark(bookmarkID, destFolder.ID, len(destFolder.Children))
+		if err != nil {
+			moveErrors = append(moveErrors, err.Error())
+		} else {
+			movedCount++
+		}
+	}
+
+	var remainingBookmarks []*models.Bookmark
+	for _, bookmark := range m.bookmarks {
+		if !m.selectedBookmarks[bookmark.ID] {
+			remainingBookmarks = append(remainingBookmarks, bookmark)
+		}
+	}
+	m.bookmarks = remainingBookmarks
+
+	m.selectedBookmarks = make(map[int64]bool)
+	m.hasPendingChanges = true
+	m.editMode = EditNone
+
+	if m.listCursor >= len(m.bookmarks) && len(m.bookmarks) > 0 {
+		m.listCursor = len(m.bookmarks) - 1
+	}
+
+	if len(moveErrors) > 0 {
+		m.statusMessage = fmt.Sprintf("⚠ Moved %d/%d to %s (Ctrl+S to commit)", movedCount, movedCount+len(moveErrors), destFolder.Title)
+	} else {
+		m.statusMessage = fmt.Sprintf("✓ Moved %d bookmarks to %s (Ctrl+S to commit)", movedCount, destFolder.Title)
+	}
+
+	return m
 }

@@ -30,6 +30,10 @@ gophermark
 ### Editing
 - `e` - Edit selected bookmark (title/URL)
 - `n` - Add new bookmark
+- `s` - Quick add to Scratch (unsorted links to refine later)
+- `S` - Jump to Scratch folder
+- `Esc` - Exit Scratch folder (navigate to Bookmarks Bar)
+- `b` - Bulk move selected items (only in Scratch folder)
 - `m` - Toggle selection for batch operations
 - `d` - Delete selected bookmark(s)
 

@@ -224,3 +224,42 @@ func (s *StagingDB) AddBookmark(parentID int64, title, url string) error {
 func currentMicroseconds() int64 {
 	return int64(time.Now().UnixNano() / 1000)
 }
+
+func (s *StagingDB) FindOrCreateScratchFolder() (int64, error) {
+	var folderID int64
+	err := s.conn.QueryRow("SELECT id FROM moz_bookmarks WHERE type = 2 AND title = 'Scratch'").Scan(&folderID)
+	if err == nil {
+		return folderID, nil
+	}
+
+	if err != sql.ErrNoRows {
+		return 0, fmt.Errorf("failed to query scratch folder: %w", err)
+	}
+
+	var menuID int64
+	err = s.conn.QueryRow("SELECT id FROM moz_bookmarks WHERE guid = 'menu________'").Scan(&menuID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to find bookmarks menu: %w", err)
+	}
+
+	var maxPosition int
+	err = s.conn.QueryRow("SELECT COALESCE(MAX(position), -1) FROM moz_bookmarks WHERE parent = ?", menuID).Scan(&maxPosition)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get max position: %w", err)
+	}
+
+	result, err := s.conn.Exec(`
+		INSERT INTO moz_bookmarks (type, fk, parent, position, title, dateAdded, lastModified, guid)
+		VALUES (2, NULL, ?, ?, 'Scratch', ?, ?, lower(hex(randomblob(16))))
+	`, menuID, maxPosition+1, currentMicroseconds(), currentMicroseconds())
+	if err != nil {
+		return 0, fmt.Errorf("failed to create scratch folder: %w", err)
+	}
+
+	folderID, err = result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get folder ID: %w", err)
+	}
+
+	return folderID, nil
+}
